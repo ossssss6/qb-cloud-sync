@@ -1,32 +1,36 @@
 // src/core/task-processor.service.ts
 import path from 'node:path'; // 导入 Node.js 的 path 模块
 import { PrismaClient, TaskStatus, TorrentTask } from '@prisma/client';
-import { IAppConfig } from '../interfaces/config.types';
+import { IAppConfig, IArchivingRule } from '../interfaces/config.types'; // 导入 IArchivingRule
 import { createLogger } from '../services/logger.service';
-import { Logger as WinstonLogger } from 'winston'; // 从 winston 导入 Logger 类型
+import { Logger as WinstonLogger } from 'winston';
 import { QBittorrentService, QBittorrentTorrent } from './qbittorrent.service';
-// import UploaderService from './uploader.service'; // 稍后创建和取消注释
+import { UploaderService } from './uploader.service'; // 导入 UploaderService
 // import FileManagerService from './file-manager.service'; // 稍后创建和取消注释
 // import MailerService from '../services/mailer.service'; // 稍后创建和取消注释
 
 export class TaskProcessorService {
-  private logger: WinstonLogger; // 服务自身的 logger 实例
-  private isRunning: boolean = false; // 标记服务是否正在运行
-  private pollIntervalId?: NodeJS.Timeout; // 轮询定时器的 ID
-  private qbService: QBittorrentService; // QBittorrent 服务实例
+  private logger: WinstonLogger;
+  private isRunning: boolean = false;
+  private pollIntervalId?: NodeJS.Timeout;
+  private qbService: QBittorrentService;
+  private uploaderService: UploaderService; // UploaderService 实例
 
   constructor(
-    private config: IAppConfig, // 应用配置
-    private prisma: PrismaClient // Prisma 客户端实例
-    // private uploaderService: UploaderService, // 上传服务 (稍后注入)
+    private config: IAppConfig,
+    private prisma: PrismaClient
     // private fileManagerService: FileManagerService, // 文件管理服务 (稍后注入)
     // private mailerService: MailerService, // 邮件服务 (稍后注入)
   ) {
-    this.logger = createLogger('TaskProcessorService'); // 创建此服务的 logger
-    // 实例化 QBittorrentService
+    this.logger = createLogger('TaskProcessorService');
     this.qbService = new QBittorrentService(
-      this.config.qbittorrent, // 传递 qB 相关配置
-      this.logger.child({ module: 'QBittorrentService' }) // 为 qB 服务创建子 logger，方便区分日志来源
+      this.config.qbittorrent,
+      this.logger.child({ module: 'QBittorrentService' })
+    );
+    // 实例化 UploaderService
+    this.uploaderService = new UploaderService(
+      this.config.rclone, // 传递 rclone 配置
+      this.logger.child({ module: 'UploaderService' }) // 为 uploader 服务创建子 logger
     );
   }
 
@@ -40,16 +44,12 @@ export class TaskProcessorService {
     }
     this.isRunning = true;
     this.logger.info('任务处理器已启动。');
-    this.logger.info(
-      `每隔 ${this.config.taskProcessor.pollIntervalMs / 1000} 秒轮询 qBittorrent。`
-    );
+    this.logger.info(`每隔 ${this.config.taskProcessor.pollIntervalMs / 1000} 秒轮询。`);
 
-    // 立即执行一次任务处理，然后设置定时器进行周期性轮询
-    await this.processTasks();
+    await this.processTasks(); // 立即执行一次
 
     this.pollIntervalId = setInterval(async () => {
       if (!this.isRunning) {
-        // 如果服务已标记为停止，则跳过本次轮询
         this.logger.info('任务处理器正在停止，跳过当前轮询周期。');
         return;
       }
@@ -66,9 +66,8 @@ export class TaskProcessorService {
       return;
     }
     this.logger.info('正在停止任务处理器...');
-    this.isRunning = false; // 标记服务为停止状态
+    this.isRunning = false;
     if (this.pollIntervalId) {
-      // 清除轮询定时器
       clearInterval(this.pollIntervalId);
       this.pollIntervalId = undefined;
     }
@@ -76,148 +75,312 @@ export class TaskProcessorService {
   }
 
   /**
+   * 根据智能归档规则和种子信息计算远程相对路径。
+   * @param torrent qB 种子信息
+   * @param rules 归档规则数组
+   * @returns 计算出的远程相对路径，如果无匹配规则则为 undefined。
+   */
+  private calculateRemoteRelativePath(
+    torrent: QBittorrentTorrent,
+    rules: IArchivingRule[]
+  ): string | undefined {
+    this.logger.debug(`开始为种子 "${torrent.name}" 计算远程路径...`);
+    let defaultRuleActionPath: string | undefined = undefined;
+
+    for (const rule of rules) {
+      let match = false;
+      if (rule.if === 'default') {
+        defaultRuleActionPath = rule.then.remotePath;
+        continue; // 默认规则最后处理
+      }
+
+      const conditions = rule.if;
+      // 检查分类
+      if (
+        conditions.category &&
+        torrent.category.toLowerCase() === conditions.category.toLowerCase()
+      ) {
+        match = true;
+      }
+      // 检查标签 (可以是单个标签字符串或字符串数组)
+      if (conditions.tags) {
+        const torrentTags = torrent.tags.split(',').map((tag) => tag.trim().toLowerCase());
+        if (Array.isArray(conditions.tags)) {
+          if (conditions.tags.some((tag) => torrentTags.includes(tag.toLowerCase()))) {
+            match = true;
+          }
+        } else if (torrentTags.includes(conditions.tags.toLowerCase())) {
+          match = true;
+        }
+      }
+      // 检查名称正则匹配
+      if (conditions.name_matches) {
+        try {
+          const regex = new RegExp(conditions.name_matches, 'i'); // 'i' 表示不区分大小写
+          if (regex.test(torrent.name)) {
+            match = true;
+          }
+        } catch (e) {
+          this.logger.warn(`归档规则中的正则表达式无效: "${conditions.name_matches}"`, e);
+        }
+      }
+      // 注意: 如果一个种子匹配多个条件 (例如同时匹配分类和标签)，需要定义规则的优先级或只取第一个匹配。
+      // 目前的逻辑是，只要任一条件匹配，就认为规则匹配。可以根据需要调整为 AND 或更复杂的逻辑。
+
+      if (match) {
+        this.logger.info(
+          `种子 "${torrent.name}" 匹配规则: ${rule.description || JSON.stringify(rule.if)}`
+        );
+        let remotePath = rule.then.remotePath;
+        // 替换占位符
+        remotePath = remotePath.replace(/{torrentName}/g, torrent.name);
+        remotePath = remotePath.replace(/{category}/g, torrent.category || 'Uncategorized');
+        // 简单提取年份 (如果存在于种子名中，例如 "Movie Title (2023)")
+        const yearMatch = torrent.name.match(/\((\d{4})\)/);
+        remotePath = remotePath.replace(
+          /{year}/g,
+          yearMatch && yearMatch[1] ? yearMatch[1] : 'UnknownYear'
+        );
+        // TODO: 可以添加更多占位符替换，如 {season}, {episode} 等，需要更复杂的解析
+
+        // 清理路径，移除开头和结尾的斜杠，确保路径分隔符正确
+        remotePath = remotePath.replace(/^\/+|\/+$/g, '').replace(/\\/g, '/');
+        this.logger.debug(`计算得到的远程相对路径: "${remotePath}"`);
+        return remotePath;
+      }
+    }
+
+    // 如果没有其他规则匹配，使用默认规则 (如果存在)
+    if (defaultRuleActionPath) {
+      this.logger.info(`种子 "${torrent.name}" 使用默认归档规则。`);
+      let remotePath = defaultRuleActionPath;
+      remotePath = remotePath.replace(/{torrentName}/g, torrent.name);
+      remotePath = remotePath.replace(/{category}/g, torrent.category || 'Uncategorized');
+      const yearMatch = torrent.name.match(/\((\d{4})\)/);
+      remotePath = remotePath.replace(
+        /{year}/g,
+        yearMatch && yearMatch[1] ? yearMatch[1] : 'UnknownYear'
+      );
+      remotePath = remotePath.replace(/^\/+|\/+$/g, '').replace(/\\/g, '/');
+      this.logger.debug(`计算得到的默认远程相对路径: "${remotePath}"`);
+      return remotePath;
+    }
+
+    this.logger.warn(
+      `种子 "${torrent.name}" 未匹配任何归档规则，也无默认规则。将使用基础上传路径。`
+    );
+    return undefined; // 或返回一个默认的基础路径，如 path.basename(torrent.name)
+  }
+
+  /**
    * 执行一次任务处理周期。
-   * 包括：从qB获取种子 -> 同步到数据库 -> 从数据库获取待处理任务 -> 处理任务。
    */
   private async processTasks(): Promise<void> {
     this.logger.info('开始任务处理周期...');
-
     try {
-      // 步骤 1: 从 qBittorrent 获取已完成的种子
       this.logger.debug('正在从 qBittorrent 获取已完成的种子...');
       const completedQbTorrents: QBittorrentTorrent[] = await this.qbService.getCompletedTorrents();
       this.logger.info(`从 qBittorrent 找到 ${completedQbTorrents.length} 个已完成的种子。`);
 
       if (completedQbTorrents.length > 0) {
-        this.logger.info('获取到的部分种子示例:');
+        this.logger.debug('获取到的部分种子示例:');
         completedQbTorrents.slice(0, 3).forEach((t) => {
-          // 只打印前3个作为调试示例
-          this.logger.info(
-            `  - 名称: ${t.name}, 哈希: ${t.hash}, 大小: ${(t.size / (1024 * 1024)).toFixed(2)}MB, 保存路径: ${t.save_path}`
+          this.logger.debug(
+            `  - 名称: ${t.name}, 哈希: ${t.hash}, 大小: ${(t.size / (1024 * 1024)).toFixed(2)}MB, 保存路径: ${t.save_path}, 内容路径: ${t.content_path}`
           );
         });
       }
 
-      // 步骤 2: 与数据库同步，对于新发现的已完成种子，在数据库中创建任务记录
       for (const qbTorrent of completedQbTorrents) {
         try {
-          // 检查数据库中是否已存在该哈希值的任务
           const existingTask = await this.prisma.torrentTask.findUnique({
             where: { hash: qbTorrent.hash },
           });
 
           if (!existingTask) {
-            // 如果任务不存在，则创建新任务
             this.logger.info(
-              `发现新种子待处理: "${qbTorrent.name}" (哈希: ${qbTorrent.hash})。正在添加到数据库...`
+              `发现新种子待处理: "${qbTorrent.name}" (哈希: ${qbTorrent.hash}). 正在添加到数据库...`
             );
+
             // 确定本地文件/目录的准确路径
-            // qB的 save_path 是下载目录，name 是种子显示名称。
-            // content_path 是实际内容路径，对于单文件种子可能包含文件名。
-            // 我们需要一个指向种子内容根的路径。
-            let localContentPath = qbTorrent.save_path; // 默认为保存路径
-            if (qbTorrent.content_path && qbTorrent.content_path.startsWith(qbTorrent.save_path)) {
-              // 如果 content_path 存在且在 save_path 内或等于它，则 content_path 更精确
-              localContentPath = qbTorrent.content_path;
-            } else {
-              // 对于多文件种子，通常是 save_path + torrent_name (文件夹名)
-              // 对于单文件种子，可能是 save_path + file_name (如果qB没有创建子目录)
-              // qB API 的 save_path 指向的是种子内容所在的目录。
-              // 如果种子是单文件，save_path + name 可能是目录 + 文件名。
-              // 如果是多文件，save_path + name 通常是 目录 + 种子创建的子目录名。
-              //  safest bet for root is usually save_path if content_path isn't more specific or doesn't exist
-              // qB's save_path + name is often the full path to the content (file or folder)
-              // Let's assume save_path already points to the root content directory for multi-file torrents
-              // or includes the filename for single-file torrents if no subfolder is created by qB.
-              // If qB creates a subfolder with the torrent's name, then save_path is the parent,
-              // and the actual content is in save_path/torrent_name.
-              // The `name` field from qB is the torrent's display name, which is often also the root folder/file name.
-              // So, path.join(qbTorrent.save_path, qbTorrent.name) should be the content root for multi-file torrents.
-              // For single file torrents, if save_path is just a directory, then save_path/name is the file.
-              // If save_path already includes the filename for single file torrents, then qbTorrent.name might be redundant or different.
-              // The most reliable way is often to iterate files within the torrent if qB API provides file list per torrent.
-              // For now, a common case is that the content is in a folder named after the torrent, inside save_path.
-              // Or, if it's a single file, it's directly in save_path.
-              // `content_path` is often the most accurate. If not available, `save_path` is the directory, and `name` is the file/folder within it.
-              // If qB "Keep incomplete torrents in:" is set, save_path might be that temp path.
-              // content_path will be the final path.
-              // Let's prioritize content_path if it's valid and different from save_path, otherwise join save_path and name.
-              localContentPath =
-                qbTorrent.content_path && qbTorrent.content_path !== qbTorrent.save_path
-                  ? qbTorrent.content_path
-                  : path.join(qbTorrent.save_path, qbTorrent.name);
-            }
+            const localContentPath =
+              qbTorrent.content_path && qbTorrent.content_path !== qbTorrent.save_path
+                ? qbTorrent.content_path
+                : path.join(qbTorrent.save_path, qbTorrent.name);
+
+            // 根据归档规则计算远程相对路径
+            const calculatedRemoteRelPath = this.calculateRemoteRelativePath(
+              qbTorrent,
+              this.config.archivingRules
+            );
 
             await this.prisma.torrentTask.create({
               data: {
                 hash: qbTorrent.hash,
                 name: qbTorrent.name,
                 localPath: localContentPath,
-                addedAt: new Date(qbTorrent.added_on * 1000), // qB 时间戳是秒，Date 需要毫秒
+                addedAt: new Date(qbTorrent.added_on * 1000),
                 completedAt:
                   qbTorrent.completion_on > 0 ? new Date(qbTorrent.completion_on * 1000) : null,
-                status: TaskStatus.PENDING_UPLOAD, // 初始状态
-                uploadSize: BigInt(qbTorrent.size), // 存储种子总大小
+                status: TaskStatus.PENDING_UPLOAD,
+                uploadSize: BigInt(qbTorrent.size),
+                calculatedRemotePath: calculatedRemoteRelPath, // 存储计算出的相对路径
               },
             });
           } else {
-            // 如果任务已存在
             this.logger.debug(
               `种子 "${qbTorrent.name}" (哈希: ${qbTorrent.hash}) 已存在于数据库，状态为 ${existingTask.status}。跳过创建。`
             );
-            // TODO: 后续可以根据 existingTask.status 决定是否需要重新处理或更新种子信息 (例如 localPath 变化)
           }
         } catch (dbError) {
           this.logger.error(
-            `处理 qB 种子 "${qbTorrent.name}" (哈希: ${qbTorrent.hash}) 以同步到数据库时出错:`,
+            `处理 qB 种子 "${qbTorrent.name}" (哈希: ${qbTorrent.hash}) 同步到数据库时出错:`,
             dbError
           );
         }
       }
 
-      // 步骤 3: 从数据库获取所有待处理的上传任务
-      this.logger.debug('正在从数据库获取 PENDING_UPLOAD 状态的任务...');
-      const pendingUploadTasks = await this.prisma.torrentTask.findMany({
+      this.logger.debug('正在从数据库获取待处理的任务...');
+      const tasksToProcess = await this.prisma.torrentTask.findMany({
         where: {
-          status: TaskStatus.PENDING_UPLOAD,
-          // uploadAttempts: { lt: 5 } // 示例：可以添加重试次数限制
+          OR: [
+            { status: TaskStatus.PENDING_UPLOAD },
+            {
+              status: TaskStatus.UPLOAD_FAILED,
+              uploadAttempts: { lt: 5 }, // 示例：最多重试5次
+            },
+            // { // 验证失败的重试逻辑稍后添加
+            //   status: TaskStatus.VERIFICATION_FAILED,
+            //   verificationAttempts: { lt: 3 },
+            // },
+          ],
         },
-        orderBy: { createdAt: 'asc' }, // 按创建时间升序处理，保证先完成的先上传
+        orderBy: { createdAt: 'asc' },
+        take: this.config.taskProcessor.maxConcurrentUploads || 1,
       });
-      this.logger.info(`从数据库找到 ${pendingUploadTasks.length} 个 PENDING_UPLOAD 状态的任务。`);
+      this.logger.info(`从数据库找到 ${tasksToProcess.length} 个任务待处理。`);
 
-      // 步骤 4: 遍历并处理每个待上传任务 (目前是占位符，后续将实现状态机逻辑)
-      // for (const task of pendingUploadTasks) {
-      //   this.logger.info(`正在处理任务: ${task.name} (ID: ${task.id}, 状态: ${task.status})`);
-      //   await this.handleTask(task); // handleTask 将是状态机实现
-      // }
-      if (pendingUploadTasks.length > 0) {
-        this.logger.info(
-          `${pendingUploadTasks.length} 个 PENDING_UPLOAD 任务的后续处理逻辑尚未实现。`
-        );
+      if (tasksToProcess.length > 0) {
+        this.logger.info(`开始并发处理 ${tasksToProcess.length} 个任务...`);
+        const processingPromises = tasksToProcess.map((task) => this.handleTask(task));
+        const results = await Promise.allSettled(processingPromises);
+        results.forEach((result, index) => {
+          if (result.status === 'rejected') {
+            this.logger.error(
+              `处理任务 ${tasksToProcess[index].name} (ID: ${tasksToProcess[index].id}) 时发生未捕获的顶层错误:`,
+              result.reason
+            );
+          }
+        });
+        this.logger.info('本轮任务批处理完成。');
       }
     } catch (error) {
-      // 捕获整个处理周期中的错误
       this.logger.error('任务处理周期中发生错误:', error);
     } finally {
-      // 无论成功或失败，都记录周期结束
       this.logger.info('任务处理周期已结束。');
     }
   }
 
-  // private async handleTask(task: TorrentTask): Promise<void> {
-  //   this.logger.debug(`处理任务 ${task.hash}，当前状态 ${task.status}`);
-  //   // 这里将是状态机的主要逻辑实现，根据 task.status 执行不同操作
-  //   // 例如：上传、验证、删除本地文件、删除qB任务、发送邮件通知等
-  //
-  //   // 临时占位符，模拟工作耗时
-  //   await new Promise(resolve => setTimeout(resolve, 100));
-  // }
+  /**
+   * 处理单个任务的状态转换和操作。
+   * @param task 要处理的 TorrentTask 对象
+   */
+  private async handleTask(task: TorrentTask): Promise<void> {
+    this.logger.info(`开始处理任务: "${task.name}" (ID: ${task.id}), 当前状态: ${task.status}`);
+    try {
+      switch (task.status) {
+        case TaskStatus.PENDING_UPLOAD:
+        case TaskStatus.UPLOAD_FAILED:
+          await this.executeUploadStep(task);
+          break;
+        case TaskStatus.PENDING_VERIFICATION:
+        // case TaskStatus.VERIFICATION_FAILED: // 稍后实现验证步骤
+        //   await this.executeVerificationStep(task);
+        //   break;
+        // TODO: 处理 UPLOAD_VERIFIED_SUCCESS (触发删除等)
+        // TODO: 处理 DELETING_LOCAL, DELETING_QB_TASK 等状态
+        default:
+          this.logger.warn(`任务 "${task.name}" 状态为 ${task.status}，当前无明确处理逻辑。`);
+      }
+    } catch (error) {
+      // 捕获处理单个任务步骤中可能发生的未被子函数捕获的错误
+      this.logger.error(`处理任务 "${task.name}" (ID: ${task.id}) 步骤中发生错误:`, error);
+      // 更新任务状态为 ERROR 或保持失败状态，记录错误信息
+      await this.prisma.torrentTask.update({
+        where: { id: task.id },
+        data: {
+          status:
+            task.status === TaskStatus.UPLOADING ? TaskStatus.UPLOAD_FAILED : TaskStatus.ERROR, // 如果正在上传时失败，则为上传失败
+          errorMessage: `Error in handleTask: ${error instanceof Error ? error.message : String(error)}`,
+          updatedAt: new Date(),
+        },
+      });
+      // TODO: 发送失败通知
+    }
+  }
 
-  // 后续会添加更多方法，如:
-  // private async uploadTask(task: TorrentTask): Promise<void> { ... }
-  // private async verifyUpload(task: TorrentTask): Promise<void> { ... }
-  // private async deleteLocalContent(task: TorrentTask): Promise<void> { ... }
-  // private async deleteQbittorrentTask(task: TorrentTask): Promise<void> { ... }
-  // private async sendNotification(task: TorrentTask, success: boolean, message?: string): Promise<void> { ... }
+  /**
+   * 执行任务的上传步骤。
+   * @param task 要上传的 TorrentTask 对象
+   */
+  private async executeUploadStep(task: TorrentTask): Promise<void> {
+    this.logger.info(`[上传阶段] 任务: "${task.name}" (尝试次数: ${task.uploadAttempts + 1})`);
+    // 更新任务状态为 UPLOADING 并增加尝试次数
+    const updatedTask = await this.prisma.torrentTask.update({
+      where: { id: task.id },
+      data: {
+        status: TaskStatus.UPLOADING,
+        uploadAttempts: { increment: 1 },
+        updatedAt: new Date(),
+      },
+    });
+
+    // calculatedRemotePath 应该是创建任务时根据归档规则计算好的相对路径
+    // 如果它为空，则使用种子名作为备用（这可能不理想，取决于 rclone 的 defaultUploadPath）
+    const relativeTargetPath =
+      updatedTask.calculatedRemotePath || path.basename(updatedTask.localPath);
+    if (!updatedTask.calculatedRemotePath) {
+      this.logger.warn(
+        `任务 "${updatedTask.name}" 未找到 calculatedRemotePath, 将使用文件名 "${relativeTargetPath}" 作为远程相对路径。`
+      );
+    }
+
+    this.logger.info(`开始上传 "${updatedTask.localPath}" 到远程相对路径 "${relativeTargetPath}"`);
+    const uploadResult = await this.uploaderService.upload(
+      updatedTask.localPath,
+      relativeTargetPath
+    );
+
+    if (uploadResult.success && uploadResult.remotePath) {
+      this.logger.info(
+        `[上传阶段] 任务: "${updatedTask.name}" 初步上传成功到: ${uploadResult.remotePath}`
+      );
+      await this.prisma.torrentTask.update({
+        where: { id: updatedTask.id },
+        data: {
+          status: TaskStatus.PENDING_VERIFICATION, // 下一步是验证
+          calculatedRemotePath: uploadResult.remotePath, // 如果 uploadService 返回的是绝对路径，确保这里存储的是相对的或处理好
+          errorMessage: null, // 清除之前的错误信息
+          updatedAt: new Date(),
+        },
+      });
+      // TODO: 可以在这里立即触发验证，或者等待下一个轮询周期处理 PENDING_VERIFICATION 状态
+      // await this.executeVerificationStep(await this.prisma.torrentTask.findUniqueOrThrow({ where: { id: task.id } }));
+    } else {
+      this.logger.error(
+        `[上传阶段] 任务: "${updatedTask.name}" 上传失败. 原因: ${uploadResult.message}`
+      );
+      await this.prisma.torrentTask.update({
+        where: { id: updatedTask.id },
+        data: {
+          status: TaskStatus.UPLOAD_FAILED, // 保持或设置为上传失败
+          errorMessage: uploadResult.message || '未知的上传错误',
+          updatedAt: new Date(),
+        },
+      });
+      // TODO: 发送上传失败通知
+    }
+  }
+
+  // TODO: 实现 executeVerificationStep, executeDeleteLocalStep, executeDeleteQbTaskStep, sendNotification 等方法
 }

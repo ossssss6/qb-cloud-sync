@@ -1,0 +1,6 @@
+[
+  {
+    "if": "default",
+    "then": { "remotePath": "{tag}/{category}/{torrentName}" }
+  }
+]
