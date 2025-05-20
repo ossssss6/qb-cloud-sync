@@ -1,11 +1,21 @@
 // src/core/uploader.service.ts
 import { exec } from 'node:child_process'; // 用于执行外部命令
 import { promisify } from 'node:util';
-import path from 'node:path';
+import fs from 'node:fs/promises'; // 导入 Node.js 文件系统模块的 Promise版本
+// import path from 'node:path'; // 如果确实没有用到 'path' 模块，则删除或注释掉此行
 import { IRcloneConfig } from '../interfaces/config.types';
 import { Logger } from 'winston';
 
-const execAsync = promisify(exec);
+const execAsync = promisify(exec); // 将 exec 转换为返回 Promise 的函数
+
+// 定义一个接口来描述 execAsync 可能抛出的错误类型
+interface ExecError extends Error {
+  stdout?: string;
+  stderr?: string;
+  code?: number; // 退出码
+  killed?: boolean;
+  signal?: string;
+}
 
 export interface UploadResult {
   success: boolean;
@@ -24,11 +34,11 @@ export interface VerificationResult {
 
 export class UploaderService {
   constructor(
-    private rcloneConfig: IRcloneConfig,
-    private logger: Logger
+    private rcloneConfig: IRcloneConfig, // Rclone 相关配置
+    private logger: Logger // 日志服务实例
   ) {
     if (!this.rcloneConfig.remoteName) {
-      const errMsg = 'Rclone remote name (RCLONE_REMOTE_NAME) is not configured.';
+      const errMsg = 'Rclone 远程名称 (RCLONE_REMOTE_NAME) 未配置。';
       this.logger.error(errMsg);
       throw new Error(errMsg);
     }
@@ -37,9 +47,8 @@ export class UploaderService {
   /**
    * 将本地文件或目录上传到网盘。
    * @param localPath 要上传的本地文件或目录的绝对路径。
-   * @param relativeTargetPath 在网盘远程目标下的相对路径，例如 "movies/Action/Movie Name (2023)"。
-   *                         最终的远程路径会是 rcloneRemoteName:defaultUploadPath/relativeTargetPath。
-   * @param rcloneFlags 可选的额外 rclone 命令行参数数组，例如 ['--bwlimit', '10M']。
+   * @param relativeTargetPath 在网盘远程基础路径下的相对目标路径。
+   * @param rcloneFlags 可选的额外 rclone 命令行参数数组。
    * @returns Promise<UploadResult> 上传结果。
    */
   public async upload(
@@ -47,11 +56,8 @@ export class UploaderService {
     relativeTargetPath: string,
     rcloneFlags: string[] = []
   ): Promise<UploadResult> {
-    // 构建完整的远程路径
-    // rclone 通常的格式是 remoteName:path/to/destination
-    // 我们使用 defaultUploadPath 作为基础，然后在其下创建 relativeTargetPath
-    const remoteBase = `${this.rcloneConfig.remoteName}:${this.rcloneConfig.defaultUploadPath.replace(/\/$/, '')}`; // 确保 defaultUploadPath 末尾没有斜杠
-    const fullRemotePath = `${remoteBase}/${relativeTargetPath.replace(/^\//, '')}`; // 确保 relativeTargetPath 开头没有斜杠
+    const remoteBase = `${this.rcloneConfig.remoteName}:${this.rcloneConfig.defaultUploadPath.replace(/\/$/, '')}`;
+    const fullRemotePath = `${remoteBase}/${relativeTargetPath.replace(/^\//, '')}`;
 
     this.logger.info(`准备上传: 本地 '${localPath}' -> 远程 '${fullRemotePath}'`);
 
@@ -59,54 +65,73 @@ export class UploaderService {
       ? `--config "${this.rcloneConfig.configPath}"`
       : '';
 
-    // 默认的 rclone 参数，可以根据需要调整或从配置读取
     const defaultFlags = [
-      '--verbose', // 输出详细信息
-      '--stats=10s', // 每10秒打印一次传输状态
-      '--stats-one-line', // 状态单行输出
-      '--retries=3', // 失败重试3次
-      '--low-level-retries=10', // 低级别操作重试次数
-      // '--checksum', // 推荐开启，基于checksum而不是大小和修改时间来判断是否需要传输，更可靠但可能稍慢
-      // '--fast-list', // 如果远程支持，可以加快列表速度
-      // '--transfers=4', // 并发传输数 (rclone 内部的并发)
+      '--verbose',
+      '--stats=10s',
+      '--stats-one-line',
+      '--retries=3',
+      '--low-level-retries=10',
     ];
+
+    let isLocalPathAFile = false;
+    try {
+      const stats = await fs.stat(localPath);
+      isLocalPathAFile = stats.isFile();
+    } catch (statError: unknown) {
+      // 使用 unknown 类型
+      const errorMessage = statError instanceof Error ? statError.message : String(statError);
+      this.logger.error(`无法获取本地路径 '${localPath}' 的状态: ${errorMessage}`, statError);
+      return { success: false, message: `无法访问本地路径: ${localPath}. 错误: ${errorMessage}` };
+    }
+
+    const rcloneSubCommand = isLocalPathAFile ? 'copyto' : 'copy';
+    this.logger.info(
+      `本地路径 '${localPath}' 被识别为 [${isLocalPathAFile ? '文件' : '目录'}]。将使用 rclone '${rcloneSubCommand}' 命令。`
+    );
 
     const commandParts = [
       'rclone',
-      'copy', // 或者 'move' 如果你想上传后删除本地源 (但我们通常在验证后再删除)
+      rcloneSubCommand,
       configFileArg,
       ...defaultFlags,
-      ...rcloneFlags, // 用户传入的额外参数
-      `"${localPath}"`, // 用引号包裹路径以处理空格等特殊字符
+      ...rcloneFlags,
+      `"${localPath}"`,
       `"${fullRemotePath}"`,
     ];
-    const command = commandParts.filter((part) => part !== '').join(' '); // 过滤空参数并拼接
+    const command = commandParts.filter((part) => part !== '').join(' ');
 
-    this.logger.debug(`执行 rclone 命令: ${command}`);
+    this.logger.debug(`[RCLONE_COMMAND] 执行 rclone 命令: ${command}`);
 
     try {
-      const { stdout, stderr } = await execAsync(command, {
-        timeout: 3 * 60 * 60 * 1000,
-      }); // 设置一个较长的超时，例如3小时，以防大文件上传
+      const { stdout, stderr } = await execAsync(command, { timeout: 3 * 60 * 60 * 1000 });
 
-      if (stderr && stderr.toLowerCase().includes('error')) {
-        // 有些rclone错误可能在stderr中，但退出码仍然是0 (例如某些API限流警告后成功)
-        // 但如果明确包含 "error" 字样，我们应该更警惕
-        this.logger.warn(`Rclone 上传 '${localPath}' 可能有警告或非致命错误 (stderr): ${stderr}`);
+      if (stderr && stderr.trim() !== '') {
+        if (stderr.toLowerCase().includes('error')) {
+          this.logger.error(`Rclone 上传 '${localPath}' 遇到错误 (stderr): ${stderr}`);
+        } else {
+          this.logger.warn(
+            `Rclone 上传 '${localPath}' 有输出到 stderr (可能为警告或进度信息): ${stderr}`
+          );
+        }
       }
-      // rclone copy/move 成功时退出码通常为0
-      this.logger.info(`Rclone 上传 '${localPath}' 初步完成。Stdout: ${stdout.slice(0, 200)}...`);
+
+      this.logger.info(
+        `Rclone 上传 '${localPath}' 初步完成。Stdout (部分): ${stdout.slice(0, 300)}...`
+      );
       return { success: true, remotePath: fullRemotePath, stdout, stderr };
-    } catch (error: any) {
+    } catch (error: unknown) {
+      // 使用 unknown 类型
+      const execError = error as ExecError; // 断言为我们定义的 ExecError
+      const errorMessage = execError.stderr || execError.message || '未知 rclone 执行错误';
       this.logger.error(
-        `Rclone 上传 '${localPath}' 失败。退出码: ${error.code}. Stderr: ${error.stderr}. Stdout: ${error.stdout}`,
-        error
+        `Rclone 上传 '${localPath}' 失败。退出码: ${execError.code || 'N/A'}. Stderr: ${execError.stderr || 'N/A'}. Stdout: ${execError.stdout || 'N/A'}`,
+        execError
       );
       return {
         success: false,
-        message: `Rclone command failed with code ${error.code}: ${error.stderr || error.message}`,
-        stderr: error.stderr,
-        stdout: error.stdout,
+        message: `Rclone 命令执行失败，退出码 ${execError.code || 'N/A'}: ${errorMessage}`,
+        stderr: execError.stderr,
+        stdout: execError.stdout,
       };
     }
   }
@@ -114,7 +139,7 @@ export class UploaderService {
   /**
    * 验证文件是否已成功上传到网盘并与本地一致。
    * @param localPath 本地文件或目录的绝对路径。
-   * @param remotePath 已上传到网盘的完整远程路径 (例如 remoteName:path/to/file)。
+   * @param remotePath 已上传到网盘的完整远程路径。
    * @returns Promise<VerificationResult> 验证结果。
    */
   public async verifyUpload(localPath: string, remotePath: string): Promise<VerificationResult> {
@@ -126,44 +151,42 @@ export class UploaderService {
 
     const commandParts = [
       'rclone',
-      'check', // 使用 rclone check 命令
+      'check',
       configFileArg,
-      // '--one-way', // 如果只想检查远程是否存在本地文件，可以加 --one-way (本地 -> 远程)
-      //              // 不加的话是双向检查，确保两者完全一致
-      '--verbose', // 输出更多信息，有助于调试
+      '--verbose',
       `"${localPath}"`,
       `"${remotePath}"`,
     ];
     const command = commandParts.filter((part) => part !== '').join(' ');
 
-    this.logger.debug(`执行 rclone check 命令: ${command}`);
+    this.logger.debug(`[RCLONE_COMMAND] 执行 rclone check 命令: ${command}`);
 
     try {
-      // rclone check 成功 (文件一致) 时退出码为 0
-      const { stdout, stderr } = await execAsync(command, {
-        timeout: 30 * 60 * 1000,
-      }); // 验证超时30分钟
+      const { stdout, stderr } = await execAsync(command, { timeout: 30 * 60 * 1000 });
 
-      // 即使退出码是0，也检查stderr是否有内容，可能包含一些非致命的警告
-      if (stderr) {
-        this.logger.warn(`Rclone check '${localPath}' vs '${remotePath}' stderr: ${stderr}`);
+      if (stderr && stderr.trim() !== '') {
+        this.logger.warn(
+          `Rclone check '${localPath}' vs '${remotePath}' 有输出到 stderr: ${stderr}`
+        );
       }
-      // 如果 stdout 包含 "0 files differed" 或类似信息，通常表示成功
+
       this.logger.info(
-        `Rclone check 成功: '${localPath}' 与 '${remotePath}' 一致。Stdout: ${stdout.slice(0, 200)}...`
+        `Rclone check 成功: '${localPath}' 与 '${remotePath}' 一致。Stdout (部分): ${stdout.slice(0, 300)}...`
       );
-      return { verified: true, message: 'Files are in sync.', stdout, stderr };
-    } catch (error: any) {
-      // rclone check 退出码非0表示文件不一致或发生错误
+      return { verified: true, message: '本地与远程同步一致。', stdout, stderr };
+    } catch (error: unknown) {
+      // 使用 unknown 类型
+      const execError = error as ExecError; // 断言为我们定义的 ExecError
+      const errorMessage = execError.stderr || execError.message || '未知 rclone check 错误';
       this.logger.error(
-        `Rclone check 失败: '${localPath}' 与 '${remotePath}' 不一致或发生错误。退出码: ${error.code}. Stderr: ${error.stderr}. Stdout: ${error.stdout}`,
-        error
+        `Rclone check 失败: '${localPath}' 与 '${remotePath}' 不一致或发生错误。退出码: ${execError.code || 'N/A'}. Stderr: ${execError.stderr || 'N/A'}. Stdout: ${execError.stdout || 'N/A'}`,
+        execError
       );
       return {
         verified: false,
-        message: `Verification failed with code ${error.code}: ${error.stderr || error.message}`,
-        stdout: error.stdout,
-        stderr: error.stderr,
+        message: `验证失败，退出码 ${execError.code || 'N/A'}: ${errorMessage}`,
+        stdout: execError.stdout,
+        stderr: execError.stderr,
       };
     }
   }

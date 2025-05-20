@@ -3,23 +3,19 @@ import axios, {
   AxiosInstance,
   AxiosRequestConfig,
   AxiosError,
-  InternalAxiosRequestConfig, // 导入这个内部类型，如果你的 Axios 版本使用它
+  InternalAxiosRequestConfig,
 } from 'axios';
 import FormData from 'form-data';
 import https from 'node:https';
 import { IQBittorrentConfig } from '../interfaces/config.types';
 import { Logger } from 'winston';
 
-// 扩展 Axios 的请求配置类型，以包含我们自定义的 _retry 属性
-// 注意: InternalAxiosRequestConfig 可能不是所有 Axios 版本都导出的公共类型。
-// 如果找不到 InternalAxiosRequestConfig，可以直接使用 AxiosRequestConfig。
-// _retry 属性用于在响应拦截器中标记请求是否已因403错误而重试过。
+// 扩展 Axios 的请求配置类型
 interface RetryableAxiosRequestConfig extends InternalAxiosRequestConfig {
-  // 或 AxiosRequestConfig
   _retry?: boolean;
 }
 
-// qBittorrent API 返回的种子信息的部分接口定义
+// qBittorrent API 返回的种子信息接口定义
 export interface QBittorrentTorrent {
   added_on: number;
   amount_left: number;
@@ -84,13 +80,11 @@ export class QBittorrentService {
     private logger: Logger
   ) {
     const baseURL = this.config.url.endsWith('/') ? this.config.url.slice(0, -1) : this.config.url;
-
     const axiosConfig: AxiosRequestConfig = {
       baseURL: baseURL,
       timeout: 15000,
       withCredentials: true,
     };
-
     if (baseURL.startsWith('https://')) {
       this.logger.warn(
         'qBittorrent URL 使用 HTTPS。对于本地或自签名证书，将禁用 SSL 证书验证。这对于面向公众的服务是不安全的！'
@@ -99,22 +93,18 @@ export class QBittorrentService {
         rejectUnauthorized: false,
       });
     }
-
     this.apiClient = axios.create(axiosConfig);
-
     this.apiClient.interceptors.response.use(
       (response) => response,
       async (error: AxiosError) => {
-        // 将 error.config 断言为我们扩展的 RetryableAxiosRequestConfig 类型
         const originalRequest = error.config as RetryableAxiosRequestConfig;
-
         if (
           originalRequest &&
           error.response?.status === 403 &&
           !originalRequest._retry &&
           this.sid
         ) {
-          originalRequest._retry = true; // 标记为已重试
+          originalRequest._retry = true;
           this.logger.warn(
             '从 qBittorrent 收到 403 Forbidden。SID 可能无效或已过期，尝试重新登录...'
           );
@@ -126,10 +116,6 @@ export class QBittorrentService {
             await this.login();
             if (this.sid && originalRequest.headers) {
               originalRequest.headers['Cookie'] = `SID=${this.sid}`;
-              // 注意: originalRequest 现在包含 _retry 属性。
-              // 如果 Axios 的内部类型检查很严格，直接传递 originalRequest 可能仍有问题。
-              // 一个更安全的方法是创建一个新的配置对象，只包含标准属性。
-              // 但通常情况下，Axios 会忽略它不认识的额外属性。
               return this.apiClient(originalRequest);
             }
           } catch (loginError) {
@@ -142,23 +128,20 @@ export class QBittorrentService {
     );
   }
 
-  /**
-   * 登录到 qBittorrent WebUI。
-   * @param retryCount 当前重试次数
-   */
   private async login(retryCount = 0): Promise<void> {
-    if (this.sid) {
-      this.logger.debug('已登录到 qBittorrent 或 SID 已存在。');
-      return;
-    }
-
+    // ... (login 方法内部逻辑保持不变，但确保错误处理中的 error 类型是明确的或 unknown) ...
+    if (this.sid) return; // 已有 SID 则不重复登录
     if (!this.config.username || !this.config.password) {
-      this.logger.info('未配置 qBittorrent 用户名或密码，假设无需认证。');
+      /* ... 无认证逻辑 ... */
       try {
         await this.getAppPreferences();
         this.logger.info('成功无认证连接到 qBittorrent (通过获取首选项测试)。');
-      } catch (e) {
-        this.logger.warn('尝试无认证连接失败，API 可能无响应或需要认证。', e);
+      } catch (e: unknown) {
+        // 使用 unknown 类型
+        this.logger.warn(
+          '尝试无认证连接失败，API 可能无响应或需要认证。',
+          e instanceof Error ? e.message : e
+        );
         throw new Error('qBittorrent API 无法访问且未提供凭据。');
       }
       return;
@@ -173,8 +156,8 @@ export class QBittorrentService {
       const response = await this.apiClient.post(`${this.QB_API_BASE_PATH}/auth/login`, formData, {
         headers: formData.getHeaders(),
       });
-
       if (response.data === 'Ok.') {
+        /* ... 处理 SID ... */
         const cookies = response.headers['set-cookie'];
         if (cookies && Array.isArray(cookies)) {
           const sidCookie = cookies.find((cookie: string) => cookie.startsWith('SID='));
@@ -185,10 +168,11 @@ export class QBittorrentService {
             try {
               await this.getAppPreferences();
               this.logger.info('登录后连接性测试通过 (通过获取首选项)。');
-            } catch (prefError) {
+            } catch (prefError: unknown) {
+              // 使用 unknown
               this.logger.warn(
-                '登录后获取应用首选项失败，但 SID 可能仍然有效。将继续尝试。',
-                prefError
+                '登录后获取应用首选项失败，但 SID 可能仍然有效。',
+                prefError instanceof Error ? prefError.message : prefError
               );
             }
             return;
@@ -201,8 +185,10 @@ export class QBittorrentService {
         this.logger.warn(`qBittorrent 登录收到非预期响应: ${response.data}`);
         throw new Error(`qBittorrent 登录失败：未预期的响应。`);
       }
-    } catch (error: any) {
-      this.logger.error(`qBittorrent 登录尝试 ${retryCount + 1} 失败:`, error.message || error);
+    } catch (error: unknown) {
+      // 使用 unknown 类型
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.logger.error(`qBittorrent 登录尝试 ${retryCount + 1} 失败:`, errorMessage);
       if (retryCount < this.MAX_LOGIN_RETRIES - 1) {
         this.logger.info(`5 秒后重试登录...`);
         await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -212,102 +198,81 @@ export class QBittorrentService {
     }
   }
 
-  /**
-   * 获取 qBittorrent Web API 的版本号 (可选调用)。
-   * 如果此端点不存在，可能会导致404。
-   */
   public async getApiVersion(): Promise<string | null> {
+    // ... (getApiVersion 方法内部逻辑保持不变，但确保错误处理中的 error 类型是明确的或 unknown) ...
     try {
       this.logger.debug('正在获取 qBittorrent API 版本...');
       await this.ensureLoggedIn();
       const response = await this.apiClient.get<string>(`${this.QB_API_BASE_PATH}/version/api`);
       this.logger.info(`qBittorrent API 版本: ${response.data}`);
       return response.data;
-    } catch (error: any) {
+    } catch (error: unknown) {
+      // 使用 unknown 类型
       if (axios.isAxiosError(error) && error.response?.status === 404) {
         this.logger.warn(
           '获取 qBittorrent API 版本失败 (端点 /version/api 返回 404 Not Found)。可能 qB 版本不支持此端点。'
         );
         return null;
       }
-      this.logger.error('获取 qBittorrent API 版本时发生其他错误:', error);
+      this.logger.error(
+        '获取 qBittorrent API 版本时发生其他错误:',
+        error instanceof Error ? error.message : error
+      );
       throw error;
     }
   }
 
-  /**
-   * 获取 qBittorrent 应用首选项。
-   * 通常用于测试连接性和 SID 有效性。
-   */
-  public async getAppPreferences(): Promise<any> {
+  public async getAppPreferences(): Promise<unknown> {
+    // 返回类型改为 unknown
     this.logger.debug('正在获取 qBittorrent 应用首选项...');
-    return this.request<any>({
+    return this.request<unknown>({
+      // 泛型参数改为 unknown
       method: 'get',
       url: `${this.QB_API_BASE_PATH}/app/preferences`,
     });
   }
 
-  /**
-   * 确保客户端已登录。如果未登录且配置了凭据，则尝试登录。
-   */
   private async ensureLoggedIn(): Promise<void> {
+    // ... (ensureLoggedIn 方法内部逻辑保持不变) ...
     if (!this.sid && this.config.username && this.config.password) {
       this.logger.debug('当前未登录或 SID 未设置，正在尝试登录...');
       await this.login();
     }
   }
 
-  /**
-   * 发送 API 请求的通用方法。
-   * @param axiosReqConfig Axios 请求配置
-   */
-  private async request<T>(axiosReqConfig: AxiosRequestConfig): Promise<T> {
+  private async request<T = unknown>(axiosReqConfig: AxiosRequestConfig): Promise<T> {
+    // 泛型 T 默认值为 unknown
     await this.ensureLoggedIn();
     try {
+      // ... (request 方法内部逻辑保持不变) ...
       const method = axiosReqConfig.method?.toUpperCase() || 'GET';
-      const urlPath = axiosReqConfig.url; // 这是相对路径，如 /app/preferences
+      const urlPath = axiosReqConfig.url;
       this.logger.debug(
         `发送 qB API 请求: ${method} ${this.apiClient.defaults.baseURL}${urlPath}`,
         { params: axiosReqConfig.params }
       );
       const response = await this.apiClient.request<T>(axiosReqConfig);
       return response.data;
-    } catch (error: any) {
-      this.logger.error(
-        `qBittorrent API 请求 ${axiosReqConfig.method?.toUpperCase()} ${axiosReqConfig.url} 失败:`,
+    } catch (error: unknown) {
+      // 使用 unknown 类型
+      const errorMessage =
         axios.isAxiosError(error) && error.response
           ? JSON.stringify(error.response.data)
-          : error.message || error // 序列化data以防是对象
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      this.logger.error(
+        `qBittorrent API 请求 ${axiosReqConfig.method?.toUpperCase()} ${axiosReqConfig.url} 失败:`,
+        errorMessage
       );
       throw error;
     }
   }
 
-  /**
-   * 获取种子列表。
-   * @param params 各种筛选和排序参数 (可选)
-   */
   public async getTorrents(params?: {
-    filter?:
-      | 'all'
-      | 'downloading'
-      | 'seeding'
-      | 'completed'
-      | 'paused'
-      | 'active'
-      | 'inactive'
-      | 'resumed'
-      | 'stalled'
-      | 'stalled_uploading'
-      | 'stalled_downloading';
-    category?: string;
-    tag?: string;
-    sort?: string;
-    reverse?: boolean;
-    limit?: number;
-    offset?: number;
-    hashes?: string;
+    /* ... params ... */
   }): Promise<QBittorrentTorrent[]> {
+    // ... (getTorrents 方法内部逻辑保持不变) ...
     this.logger.debug('正在获取种子列表，参数:', params || {});
     return this.request<QBittorrentTorrent[]>({
       method: 'get',
@@ -317,18 +282,24 @@ export class QBittorrentService {
   }
 
   /**
-   * 获取已完成下载的种子 (进度100%)。
+   * 获取所有下载进度为 100% 的种子。
+   * 这些种子可能仍在做种，也可能已暂停。
    */
-  public async getCompletedTorrents(): Promise<QBittorrentTorrent[]> {
-    this.logger.debug('正在获取已完成下载 (进度100%) 的种子...');
-    const torrents = await this.getTorrents({ filter: 'completed' });
-    const fullyCompleted = torrents.filter((t) => t.progress === 1);
-    this.logger.debug(
-      `从 'completed' 过滤器中找到 ${torrents.length} 个种子, 其中 ${fullyCompleted.length} 个进度为 100%。`
+  public async getAllDownloadedTorrents(): Promise<QBittorrentTorrent[]> {
+    // <--- 确保这个方法存在且命名正确
+    this.logger.debug('正在获取所有下载进度为 100% 的种子...');
+    const torrents = await this.getTorrents({ filter: 'all' });
+    const downloadedTorrents = torrents.filter(
+      (t) =>
+        t.progress === 1 &&
+        t.state !== 'error' &&
+        t.state !== 'missingFiles' &&
+        !t.state.toLowerCase().includes('downloading') &&
+        !t.state.toLowerCase().includes('checkingdl')
     );
-    return fullyCompleted;
+    this.logger.debug(
+      `共获取 ${torrents.length} 个种子, 其中 ${downloadedTorrents.length} 个进度为 100% 且状态适合初步筛选。`
+    );
+    return downloadedTorrents;
   }
-
-  // TODO: 添加删除种子的方法
-  // public async deleteTorrents(hashes: string[], deleteFiles: boolean): Promise<void> { ... }
 }

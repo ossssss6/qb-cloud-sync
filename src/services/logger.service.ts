@@ -143,7 +143,7 @@ if (config.nodeEnv !== 'production' || ['debug', 'silly', 'verbose'].includes(co
 
 transports.push(
   new winston.transports.DailyRotateFile({
-    level: 'info',
+    level: config.logLevel,
     filename: path.join(process.cwd(), 'logs', 'app-%DATE%.log'),
     datePattern: 'YYYY-MM-DD',
     zippedArchive: true,
