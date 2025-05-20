@@ -1,0 +1,9 @@
+# Prettier ignore
+node_modules
+dist
+coverage
+logs
+package-lock.json
+CHANGELOG.md
+LICENSE
+prisma/migrations/**/*
