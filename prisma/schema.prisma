@@ -1,0 +1,55 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite" // 我们使用 SQLite
+  url      = env("DATABASE_URL") // 从 .env 文件读取数据库 URL
+}
+
+// 定义任务状态的枚举
+enum TaskStatus {
+  PENDING_UPLOAD          // 等待上传
+  UPLOADING               // 正在上传
+  UPLOAD_FAILED           // 上传失败
+  PENDING_VERIFICATION    // 等待上传验证
+  VERIFYING               // 正在验证
+  VERIFICATION_FAILED     // 验证失败
+  UPLOAD_VERIFIED_SUCCESS // 上传并验证成功 (准备删除本地)
+  DELETING_LOCAL          // 正在删除本地文件
+  LOCAL_DELETED           // 本地文件已删除
+  DELETING_QB_TASK        // 正在删除 qB 任务
+  QB_TASK_DELETED         // qB 任务已删除
+  COMPLETED               // 任务完成 (所有步骤成功)
+  SKIPPED                 // 因筛选或特定条件跳过处理
+  ERROR                   // 发生不可恢复的错误
+}
+
+// 定义 Torrent 任务模型
+model TorrentTask {
+  id                  String    @id @default(cuid()) // 主键，使用 cuid 生成唯一ID
+  hash                String    @unique // qB Infohash，必须唯一
+  name                String    // Torrent 名称
+  addedAt             DateTime  // 添加到 qB 的时间
+  completedAt         DateTime? // 下载完成时间 (可选)
+  localPath           String    // 本地保存路径
+  calculatedRemotePath String?  // 脚本计算出的网盘目标路径 (可选)
+
+  status              TaskStatus @default(PENDING_UPLOAD) // 当前任务状态
+  uploadAttempts      Int       @default(0) // 上传尝试次数
+  verificationAttempts Int       @default(0) // 验证尝试次数
+  lastAttemptAt       DateTime? @updatedAt // 上次尝试或更新时间 (使用 @updatedAt 自动更新)
+  errorMessage        String?   // 如果处理失败，记录错误信息 (可选)
+
+  uploadSize          BigInt?   // 上传文件的大小 (Bytes, 可选, 使用 BigInt 存储大数值)
+  uploadDurationMs    Int?      // 上传耗时 (毫秒, 可选)
+
+  createdAt           DateTime  @default(now()) // 记录创建时间
+  updatedAt           DateTime  @updatedAt // 记录最后更新时间 (自动)
+
+  @@index([status]) // 为 status 字段创建索引，加速按状态查询
+  @@index([hash])   // 为 hash 字段创建索引 (虽然它已经是 @unique，但显式索引有时有益)
+}

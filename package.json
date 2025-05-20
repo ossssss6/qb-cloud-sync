@@ -34,11 +34,13 @@
     "globals": "^16.1.0",
     "nodemon": "^3.1.10",
     "prettier": "^3.5.3",
+    "prisma": "^6.8.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.32.1"
   },
   "dependencies": {
+    "@prisma/client": "^6.8.2",
     "dotenv": "^16.5.0",
     "winston": "^3.17.0",
     "winston-daily-rotate-file": "^5.0.0"
