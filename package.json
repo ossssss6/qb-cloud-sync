@@ -1,0 +1,33 @@
+{
+  "name": "qb-cloud-sync",
+  "version": "1.0.0",
+  "description": "Automates uploading completed qBittorrent downloads to cloud storage with verification, local cleanup, and email notifications.",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "dev": "nodemon --watch src --exec ts-node src/main.ts --ext ts,json",
+    "lint": "eslint src/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "format": "prettier --write src/**/*.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ossssss6/qb-cloud-sync.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/ossssss6/qb-cloud-sync/issues"
+  },
+  "homepage": "https://github.com/ossssss6/qb-cloud-sync#readme",
+  "devDependencies": {
+    "@types/node": "^22.15.19",
+    "nodemon": "^3.1.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  }
+}
